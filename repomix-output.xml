@@ -136,6 +136,33 @@ async def upload_document(
     }
 </file>
 
+<file path="backend/api/chunking.py">
+import os
+from typing import List
+
+
+def chunk_text(
+    text: str, chunk_size: int | None = None, overlap: int | None = None
+) -> List[str]:
+    # Defaults via env or sane fallbacks
+    if chunk_size is None:
+        chunk_size = int(os.getenv("CHUNK_SIZE", "1200"))
+    if overlap is None:
+        overlap = int(os.getenv("CHUNK_OVERLAP", "200"))
+    chunks: List[str] = []
+    i = 0
+    n = len(text)
+    if n == 0:
+        return chunks
+    while i < n:
+        j = min(i + chunk_size, n)
+        chunks.append(text[i:j])
+        if j == n:
+            break
+        i = j - overlap if j - overlap > i else j
+    return chunks
+</file>
+
 <file path="backend/api/ingestion.py">
 import logging
 from typing import List, Any, cast
@@ -204,305 +231,6 @@ def ingestion_pipeline(doc_id: int, pdf_bytes: bytes) -> None:
             f"Ingestion pipeline failed for doc_id {doc_id}: {e}", exc_info=True
         )
         update_status(doc_id, "failed")
-</file>
-
-<file path="backend/repositories/documents.py">
-import psycopg2
-from typing import Optional, Tuple
-from .. import config
-
-
-def db_conn():
-    return psycopg2.connect(
-        f"host={config.POSTGRES_HOST} port={config.POSTGRES_PORT} dbname={config.POSTGRES_DB} user={config.POSTGRES_USER} password={config.POSTGRES_PASSWORD}"
-    )
-
-
-def insert_document(title: str, file_hash: str) -> int:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-				INSERT INTO documents (title, file_hash, status)
-				VALUES (%s, %s, 'queued')
-				RETURNING id;
-				""",
-                (title, file_hash),
-            )
-            row = cur.fetchone()
-            if row is None:
-                raise RuntimeError("Insert did not return id")
-            doc_id = row[0]
-            conn.commit()
-            return doc_id
-
-
-def find_document_by_hash(file_hash: str) -> Optional[Tuple]:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-				SELECT id, title, status, page_count, created_at, updated_at
-				FROM documents
-				WHERE file_hash = %s
-				LIMIT 1;
-				""",
-                (file_hash,),
-            )
-            return cur.fetchone()
-
-
-def get_document(doc_id: int) -> Optional[Tuple]:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-				SELECT id, title, file_hash, status, page_count, created_at, updated_at
-				FROM documents
-				WHERE id = %s
-				LIMIT 1;
-				""",
-                (doc_id,),
-            )
-            return cur.fetchone()
-
-
-def update_status(doc_id: int, status: str, page_count: int | None = None) -> None:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            if page_count is None:
-                cur.execute(
-                    "UPDATE documents SET status = %s, updated_at = now() WHERE id = %s;",
-                    (status, doc_id),
-                )
-            else:
-                cur.execute(
-                    "UPDATE documents SET status = %s, page_count = %s, updated_at = now() WHERE id = %s;",
-                    (status, page_count, doc_id),
-                )
-            conn.commit()
-</file>
-
-<file path="backend/services/embeddings.py">
-from typing import List, Optional
-from sentence_transformers import SentenceTransformer
-from .. import config
-import numpy as np
-
-
-_EMBEDDER: Optional[SentenceTransformer] = None
-
-
-def get_model() -> SentenceTransformer:
-    global _EMBEDDER
-    if _EMBEDDER is None:
-        _EMBEDDER = SentenceTransformer(config.EMBEDDING_MODEL_NAME)
-    return _EMBEDDER
-
-
-def embedding_dimension() -> int:
-    m = get_model()
-    method = getattr(m, "get_sentence_embedding_dimension", None)
-    if callable(method):
-        d = method()
-        if isinstance(d, int):
-            return d
-    # Fallback: infer from a tiny forward pass
-    arr = m.encode([""], convert_to_numpy=True)
-    try:
-        return int(arr.shape[1])  # type: ignore[attr-defined]
-    except Exception:
-        return int(len(arr[0]))
-
-
-def embedding_model_name() -> str:
-    m = get_model()
-    method = getattr(m, "get_sentence_embedding_model_name", None)
-    if callable(method):
-        v = method()
-        if isinstance(v, str) and v:
-            return v
-    return str(config.EMBEDDING_MODEL_NAME)
-
-
-def embed_texts(texts: List[str]) -> List[List[float]]:
-    model = get_model()
-    arr = model.encode(
-        texts,
-        batch_size=config.EMBED_BATCH_SIZE,
-        convert_to_numpy=True,
-        show_progress_bar=False,
-        normalize_embeddings=False,
-    )
-    if isinstance(arr, np.ndarray):
-        arr = arr.astype("float32")
-    return [row.tolist() for row in arr]
-</file>
-
-<file path="backend/services/qdrant.py">
-import re
-import logging
-from typing import List, Tuple
-from datetime import datetime
-from qdrant_client import QdrantClient
-from qdrant_client.http.models import (
-    Distance,
-    VectorParams,
-    PointStruct,
-    Filter,
-    FieldCondition,
-    MatchValue,
-)
-from .. import config
-from .embeddings import embedding_dimension, embedding_model_name
-
-_CLIENT: QdrantClient | None = None
-
-
-def client() -> QdrantClient:
-    global _CLIENT
-    if _CLIENT is None:
-        if config.QDRANT_URL:
-            _CLIENT = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY)
-        else:
-            _CLIENT = QdrantClient(
-                host=config.QDRANT_HOST,
-                port=config.QDRANT_PORT,
-                api_key=config.QDRANT_API_KEY,
-            )
-    return _CLIENT
-
-
-def collection_name() -> str:
-    model = embedding_model_name()
-    safe = re.sub(r"[^A-Za-z0-9]+", "_", model).strip("_")
-    return f"pdf_chunks__{safe}"
-
-
-def ensure_collection() -> str:
-    name = collection_name()
-    vec_size = embedding_dimension()
-    try:
-        client().get_collection(name)
-    except Exception:
-        client().create_collection(
-            collection_name=name,
-            vectors_config=VectorParams(size=vec_size, distance=Distance.COSINE),
-        )
-    return name
-
-
-def already_indexed(file_hash: str) -> bool:
-    try:
-        res = client().count(
-            collection_name=collection_name(),
-            count_filter=Filter(
-                must=[
-                    FieldCondition(key="file_hash", match=MatchValue(value=file_hash))
-                ]
-            ),
-            exact=True,
-        )
-        return (res.count or 0) > 0
-    except Exception as e:
-        logging.error(
-            f"Failed to check Qdrant index for hash {file_hash}: {e}", exc_info=True
-        )
-        return False
-
-
-def upsert_points(points: List[PointStruct]) -> None:
-    name = ensure_collection()
-    for i in range(0, len(points), config.QDRANT_UPSERT_BATCH):
-        client().upsert(
-            collection_name=name, points=points[i : i + config.QDRANT_UPSERT_BATCH]
-        )
-
-
-def build_points(
-    doc_id: int,
-    doc_title: str,
-    file_hash: str,
-    texts_with_meta: List[Tuple[str, int, int]],
-    vectors: List[List[float]],
-) -> List[PointStruct]:
-    now = datetime.utcnow().isoformat() + "Z"
-    points: List[PointStruct] = []
-    for (text, page, chunk_idx), vec in zip(texts_with_meta, vectors):
-        points.append(
-            PointStruct(
-                id=f"{file_hash}:{page}:{chunk_idx}",
-                vector=vec,
-                payload={
-                    "doc_id": doc_id,
-                    "doc_title": doc_title,
-                    "page": page,
-                    "chunk_id": chunk_idx,
-                    "chunk_text": text,
-                    "file_hash": file_hash,
-                    "created_at": now,
-                    "updated_at": now,
-                },
-            )
-        )
-    return points
-</file>
-
-<file path="backend/config.py">
-import os
-
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
-POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
-POSTGRES_DB = os.getenv("POSTGRES_DB", "ragdb")
-POSTGRES_USER = os.getenv("POSTGRES_USER", "rag")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "ragpass")
-
-EMBEDDING_MODEL_NAME = os.getenv(
-    "EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"
-)
-EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
-
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-QDRANT_UPSERT_BATCH = int(os.getenv("QDRANT_UPSERT_BATCH", "128"))
-</file>
-
-<file path="backend/api/chunking.py">
-import os
-from typing import List
-
-
-def chunk_text(
-    text: str, chunk_size: int | None = None, overlap: int | None = None
-) -> List[str]:
-    # Defaults via env or sane fallbacks
-    if chunk_size is None:
-        chunk_size = int(os.getenv("CHUNK_SIZE", "1200"))
-    if overlap is None:
-        overlap = int(os.getenv("CHUNK_OVERLAP", "200"))
-    chunks: List[str] = []
-    i = 0
-    n = len(text)
-    if n == 0:
-        return chunks
-    while i < n:
-        j = min(i + chunk_size, n)
-        chunks.append(text[i:j])
-        if j == n:
-            break
-        i = j - overlap if j - overlap > i else j
-    return chunks
-</file>
-
-<file path="backend/api/main.py">
-from fastapi import FastAPI
-from .routes.documents import router as documents_router
-
-app = FastAPI(title="AlgorithmX RAG Backend", version="0.1.0")
-
-app.include_router(documents_router)
 </file>
 
 <file path="backend/db/migrations/0001_init.sql">
@@ -594,6 +322,293 @@ if __name__ == "__main__":
     sys.exit(main())
 </file>
 
+<file path="backend/repositories/documents.py">
+import psycopg2
+from psycopg2 import pool
+from contextlib import contextmanager
+from typing import Optional, Tuple, Iterator
+from .. import config
+
+db_pool = pool.SimpleConnectionPool(
+    1,  # min connections
+    20,  # max connections
+    host=config.POSTGRES_HOST,
+    port=config.POSTGRES_PORT,
+    dbname=config.POSTGRES_DB,
+    user=config.POSTGRES_USER,
+    password=config.POSTGRES_PASSWORD,
+)
+
+
+@contextmanager
+def get_db_conn() -> Iterator[psycopg2.extensions.connection]:
+    """Provides a database connection from the pool."""
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        yield conn
+    finally:
+        if conn:
+            db_pool.putconn(conn)
+
+
+def insert_document(title: str, file_hash: str) -> int:
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+				INSERT INTO documents (title, file_hash, status)
+				VALUES (%s, %s, 'queued')
+				RETURNING id;
+				""",
+                (title, file_hash),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise RuntimeError("Insert did not return id")
+            doc_id = row[0]
+            conn.commit()
+            return doc_id
+
+
+def find_document_by_hash(file_hash: str) -> Optional[Tuple]:
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+				SELECT id, title, status, page_count, created_at, updated_at
+				FROM documents
+				WHERE file_hash = %s
+				LIMIT 1;
+				""",
+                (file_hash,),
+            )
+            return cur.fetchone()
+
+
+def get_document(doc_id: int) -> Optional[Tuple]:
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+				SELECT id, title, file_hash, status, page_count, created_at, updated_at
+				FROM documents
+				WHERE id = %s
+				LIMIT 1;
+				""",
+                (doc_id,),
+            )
+            return cur.fetchone()
+
+
+def update_status(doc_id: int, status: str, page_count: int | None = None) -> None:
+    with get_db_conn() as conn:
+        with conn.cursor() as cur:
+            if page_count is None:
+                cur.execute(
+                    "UPDATE documents SET status = %s, updated_at = now() WHERE id = %s;",
+                    (status, doc_id),
+                )
+            else:
+                cur.execute(
+                    "UPDATE documents SET status = %s, page_count = %s, updated_at = now() WHERE id = %s;",
+                    (status, page_count, doc_id),
+                )
+            conn.commit()
+</file>
+
+<file path="backend/services/embeddings.py">
+from typing import List, Optional
+from sentence_transformers import SentenceTransformer
+from .. import config
+import numpy as np
+
+
+_EMBEDDER: Optional[SentenceTransformer] = None
+
+
+def get_model() -> SentenceTransformer:
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        _EMBEDDER = SentenceTransformer(config.EMBEDDING_MODEL_NAME)
+    return _EMBEDDER
+
+
+def embedding_dimension() -> int:
+    m = get_model()
+    method = getattr(m, "get_sentence_embedding_dimension", None)
+    if callable(method):
+        d = method()
+        if isinstance(d, int):
+            return d
+    # Fallback: infer from a tiny forward pass
+    arr = m.encode([""], convert_to_numpy=True)
+    try:
+        return int(arr.shape[1])  # type: ignore[attr-defined]
+    except Exception:
+        return int(len(arr[0]))
+
+
+def embedding_model_name() -> str:
+    m = get_model()
+    method = getattr(m, "get_sentence_embedding_model_name", None)
+    if callable(method):
+        v = method()
+        if isinstance(v, str) and v:
+            return v
+    return str(config.EMBEDDING_MODEL_NAME)
+
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    model = get_model()
+    arr = model.encode(
+        texts,
+        batch_size=config.EMBED_BATCH_SIZE,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+        normalize_embeddings=False,
+    )
+    if isinstance(arr, np.ndarray):
+        arr = arr.astype("float32")
+    return [row.tolist() for row in arr]
+</file>
+
+<file path="backend/services/qdrant.py">
+import re
+import logging
+import uuid
+from typing import List, Tuple
+from datetime import datetime
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import (
+    Distance,
+    VectorParams,
+    PointStruct,
+    Filter,
+    FieldCondition,
+    MatchValue,
+)
+from .. import config
+from .embeddings import embedding_dimension, embedding_model_name
+
+_CLIENT: QdrantClient | None = None
+
+
+def client() -> QdrantClient:
+    global _CLIENT
+    if _CLIENT is None:
+        if config.QDRANT_URL:
+            _CLIENT = QdrantClient(url=config.QDRANT_URL, api_key=config.QDRANT_API_KEY)
+        else:
+            _CLIENT = QdrantClient(
+                host=config.QDRANT_HOST,
+                port=config.QDRANT_PORT,
+                api_key=config.QDRANT_API_KEY,
+            )
+    return _CLIENT
+
+
+def collection_name() -> str:
+    model = embedding_model_name()
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", model).strip("_")
+    return f"pdf_chunks__{safe}"
+
+
+def ensure_collection() -> str:
+    name = collection_name()
+    vec_size = embedding_dimension()
+    try:
+        client().get_collection(name)
+    except Exception:
+        client().create_collection(
+            collection_name=name,
+            vectors_config=VectorParams(size=vec_size, distance=Distance.COSINE),
+        )
+    return name
+
+
+def already_indexed(file_hash: str) -> bool:
+    try:
+        res = client().count(
+            collection_name=collection_name(),
+            count_filter=Filter(
+                must=[
+                    FieldCondition(key="file_hash", match=MatchValue(value=file_hash))
+                ]
+            ),
+            exact=True,
+        )
+        return (res.count or 0) > 0
+    except Exception as e:
+        logging.error(
+            f"Failed to check Qdrant index for hash {file_hash}: {e}", exc_info=True
+        )
+        return False
+
+
+def upsert_points(points: List[PointStruct]) -> None:
+    name = ensure_collection()
+    for i in range(0, len(points), config.QDRANT_UPSERT_BATCH):
+        client().upsert(
+            collection_name=name, points=points[i : i + config.QDRANT_UPSERT_BATCH]
+        )
+
+
+def build_points(
+    doc_id: int,
+    doc_title: str,
+    file_hash: str,
+    texts_with_meta: List[Tuple[str, int, int]],
+    vectors: List[List[float]],
+) -> List[PointStruct]:
+    now = datetime.utcnow().isoformat() + "Z"
+    points: List[PointStruct] = []
+    namespace = uuid.UUID("a7463525-4a6c-48b8-b12e-2f5a5e334335")
+
+    for (text, page, chunk_idx), vec in zip(texts_with_meta, vectors):
+        point_name = f"{file_hash}:{page}:{chunk_idx}"
+        point_id = str(uuid.uuid5(namespace, point_name))
+
+        points.append(
+            PointStruct(
+                id=point_id,
+                vector=vec,
+                payload={
+                    "doc_id": doc_id,
+                    "doc_title": doc_title,
+                    "page": page,
+                    "chunk_id": chunk_idx,
+                    "chunk_text": text,
+                    "file_hash": file_hash,
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+        )
+    return points
+</file>
+
+<file path="backend/config.py">
+import os
+
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_DB = os.getenv("POSTGRES_DB", "ragdb")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "rag")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "ragpass")
+
+EMBEDDING_MODEL_NAME = os.getenv(
+    "EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2"
+)
+EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "64"))
+
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_HOST = os.getenv("QDRANT_HOST", "localhost")
+QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
+QDRANT_UPSERT_BATCH = int(os.getenv("QDRANT_UPSERT_BATCH", "128"))
+</file>
+
 <file path="infra/docker-compose.yml">
 services:
   postgres:
@@ -649,10 +664,21 @@ wheels/
 .venv
 
 .env
+
+repomix-output.xml
 </file>
 
 <file path=".python-version">
 3.12
+</file>
+
+<file path="backend/api/main.py">
+from fastapi import FastAPI
+from .routes.documents import router as documents_router
+
+app = FastAPI(title="AlgorithmX RAG Backend", version="0.1.0")
+
+app.include_router(documents_router)
 </file>
 
 <file path="pyproject.toml">
