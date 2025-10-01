@@ -2,6 +2,7 @@ Prerequisites
 
 - docker (https://docs.docker.com/engine/install/)
 - uv (https://docs.astral.sh/uv/getting-started/installation/)
+- groq api key (https://console.groq.com/keys)
 
 How to run
 
