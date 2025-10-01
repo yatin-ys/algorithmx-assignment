@@ -1,3 +1,8 @@
+Prerequisites
+
+- docker (https://docs.docker.com/engine/install/)
+- uv (https://docs.astral.sh/uv/getting-started/installation/)
+
 How to run
 
 ```bash
