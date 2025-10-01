@@ -6,11 +6,17 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi[standard]>=0.118.0",
+    "langchain>=0.3.27",
+    "langchain-core>=0.3.76",
+    "langchain-groq>=0.3.8",
     "numpy>=2.3.3",
     "psycopg2-binary>=2.9.10",
     "pydantic>=2.11.9",
     "pymupdf>=1.26.4",
+    "python-dotenv>=1.1.1",
     "python-multipart>=0.0.20",
     "qdrant-client>=1.15.1",
+    "requests>=2.32.5",
     "sentence-transformers>=5.1.1",
+    "streamlit>=1.50.0",
 ]

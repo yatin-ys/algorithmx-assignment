@@ -11,4 +11,4 @@ wheels/
 
 .env
 
-repomix-output.xml
+repomix-output.*
