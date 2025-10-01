@@ -5,7 +5,11 @@ git clone https://github.com/yatin-ys/algorithmx-assignment.git
 
 uv sync # for python virtual env
 
+source .venv/bin/activate # activate env
+
 docker compose up -d #for postgres and qdrant
+
+python -m backend.db.migrate # run migration, make sure postgres is running 
 
 fastapi dev backend/api/main.py # for fastapi server
 
